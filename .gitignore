@@ -1,3 +1,4 @@
 int8-gemm-small
 int8-gemm-large
-
+bf16-gemm-small
+bf16-gemm-large

@@ -3,7 +3,9 @@
 #include <unistd.h>
 #include <sys/syscall.h>
 #include <cstdint>
+#include <limits>
 #include <random>
+#include <cstring>
 
 #define XFEATURE_XTILECFG 17
 #define XFEATURE_XTILEDATA 18
@@ -53,33 +55,75 @@ void init_int8_buffer(int8_t* buffer, int length) {
     }
 }
 
+struct bfloat16 {
+    uint16_t value;
+
+    // Default constructor
+    bfloat16() : value(0) {}
+
+    // Construct from float
+    bfloat16(float f) {
+        uint32_t tmp;
+        std::memcpy(&tmp, &f, sizeof(tmp));
+        // Round to nearest even when truncating lower 16 bits
+        uint32_t rounding_bias = ((tmp >> 16) & 1) + 0x7FFF;
+        tmp += rounding_bias;
+        value = static_cast<uint16_t>(tmp >> 16);
+    }
+
+    // Convert back to float
+    operator float() const {
+        uint32_t tmp = static_cast<uint32_t>(value) << 16;
+        float f;
+        std::memcpy(&f, &tmp, sizeof(f));
+        return f;
+    }
+};
+
+void init_bf16_buffer(bfloat16* buffer, int length) {
+    std::random_device rd; // obtain a random number from hardware
+    std::mt19937 gen(rd()); // seed the generator
+    std::uniform_int_distribution<> distr(-128, 127); // define the range
+    for (int i = 0; i < length; ++i) {
+        buffer[i] = bfloat16(distr(gen) / 120.0f);
+    }
+}
+
 // assume B's shape = [K, N]
-// Reorder from [K, N] to [K/4, N, 4]
-void pack_B_to_vnni(int8_t* in, int N, int K, int8_t* out) {
+// Reorder from [K, N] to [K/vnni_size, N, vnni_size]
+template <typename T>
+void pack_B_to_vnni(T* in, int N, int K, T* out) {
+    constexpr int vnni_size = std::is_same<T, int8_t>::value ? 4 : 2;
     for (int k = 0; k < K; ++k) {
         for (int n = 0; n < N; ++n) {
-            out[(k / 4) * N * 4 + n * 4 + k % 4] = in[k * N + n];
+            out[(k / vnni_size) * N * vnni_size + n * vnni_size + k % vnni_size] = in[k * N + n];
         }
     }
 }
 
-void int8_gemm_ref(int8_t* A, int8_t* B, int32_t* C, int M, int N, int K) {
+template <typename in_dtype, typename acc_dtype>
+void gemm_ref(in_dtype* A, in_dtype* B, acc_dtype* C, int M, int N, int K) {
     for (int m = 0; m < M; ++m) {
         for (int n = 0; n < N; ++n) {
-            int32_t acc = 0;
+            acc_dtype acc = 0;
             for (int k = 0; k < K; ++k) {
-                acc += A[m * K + k] * B[k * N + n];
+                acc += (acc_dtype)A[m * K + k] * (acc_dtype)B[k * N + n];
             }
             C[m * N + n] = acc;
         }
     }
 }
 
-void check_results(int32_t* C, int32_t* C_ref, int M, int N) {
+template <typename T>
+void check_results(T* C, T* C_ref, int M, int N, T tolerance = 0) {
     int error_count = 0;
     for (int m = 0; m < M; ++m) {
         for (int n = 0; n < N; ++n) {
-            if (C[m * N + n] != C_ref[m * N + n]) ++ error_count;
+            if (std::fabs(C[m * N + n] - C_ref[m * N + n]) > tolerance) {
+              std::cout << "error: ref=" << C[m * N + n] << " vs actual=" << C_ref[m * N + n]
+                  << ", diff = " << std::fabs(C[m * N + n] - C_ref[m * N + n]) << std::endl;
+              ++ error_count;
+            }
         }
     }
     if (error_count == 0) std::cout << "OK\n";
